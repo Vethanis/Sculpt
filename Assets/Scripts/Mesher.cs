@@ -179,7 +179,7 @@ public struct CSGJob : IJobParallelFor
     readonly int        m_dimension;
     float               m_pitch;
     float               m_pointSize;
-    NativeArray<uint>   m_ran;
+    NativeArray<byte>   m_ran;
     NativeArray<Vert>   m_positions;
     NativeArray<Vert>   m_normals;
 
@@ -193,7 +193,7 @@ public struct CSGJob : IJobParallelFor
         m_pointSize = ptSize;
         m_dimension = dimension;
         m_list      = default(NativeArray<CSG>);
-        m_ran       = default(NativeArray<uint>);
+        m_ran       = default(NativeArray<byte>);
         m_positions = default(NativeArray<Vert>);
         m_normals   = default(NativeArray<Vert>);
         m_origin    = default(float3);
@@ -219,7 +219,7 @@ public struct CSGJob : IJobParallelFor
         {
             m_list[i] = CSG.ms_pool[list[i]];
         }
-        m_ran = new NativeArray<uint>(
+        m_ran = new NativeArray<byte>(
             capacity,
             Allocator.TempJob,
             NativeArrayOptions.ClearMemory);
@@ -311,51 +311,68 @@ public struct CSGJob : IJobParallelFor
         int count = 0;
         foreach (var ran in m_ran)
         {
-            ++count;
-        }
-        var verts = new Vector3[count * 4];
-        var norms = new Vector3[count * 4];
-        var inds = new int[count * 6];
-
-        int j = 0;
-        for (int i = 0; i < m_ran.Length; ++i)
-        {
-            if (m_ran[i] != 0)
+            if(ran != 0)
             {
+                ++count;
+            }
+        }
+
+        mesh.Clear();
+
+        if (count != 0)
+        {
+            var verts = new Vector3[count * 4];
+            var norms = new Vector3[count * 4];
+            var inds = new int[count * 6];
+
+            int j = 0;
+            for (int i = 0; i < m_ran.Length; ++i)
+            {
+                if (m_ran[i] == 0)
+                {
+                    continue;
+                }
+
                 var vert = m_positions[i];
-                verts[j * 4 + 0] = vert.a;
-                verts[j * 4 + 1] = vert.b;
-                verts[j * 4 + 2] = vert.c;
-                verts[j * 4 + 3] = vert.d;
+
+                int a = j * 4 + 0;
+                int b = j * 4 + 1;
+                int c = j * 4 + 2;
+                int d = j * 4 + 3;
+
+                verts[a] = vert.a;
+                verts[b] = vert.b;
+                verts[c] = vert.c;
+                verts[d] = vert.d;
 
                 var norm = m_normals[i];
-                norms[j * 4 + 0] = norm.a;
-                norms[j * 4 + 1] = norm.b;
-                norms[j * 4 + 2] = norm.c;
-                norms[j * 4 + 3] = norm.d;
+                norms[a] = norm.a;
+                norms[b] = norm.b;
+                norms[c] = norm.c;
+                norms[d] = norm.d;
 
-                inds[j * 6 + 0] = j * 4 + 0;
-                inds[j * 6 + 1] = j * 4 + 2;
-                inds[j * 6 + 2] = j * 4 + 1;
+                inds[j * 6 + 0] = a;
+                inds[j * 6 + 1] = c;
+                inds[j * 6 + 2] = b;
 
-                inds[j * 6 + 3] = j * 4 + 0;
-                inds[j * 6 + 4] = j * 4 + 3;
-                inds[j * 6 + 5] = j * 4 + 2;
+                inds[j * 6 + 3] = a;
+                inds[j * 6 + 4] = d;
+                inds[j * 6 + 5] = c;
 
                 ++j;
             }
+            
+            mesh.vertices = verts;
+            mesh.normals = norms;
+            mesh.triangles = inds;
+
+            mesh.RecalculateBounds();
         }
 
         m_list.Dispose();
         m_ran.Dispose();
         m_positions.Dispose();
         m_normals.Dispose();
-        
-        mesh.vertices   = verts;
-        mesh.normals    = norms;
-        mesh.triangles  = inds;
-
-        mesh.RecalculateBounds();
     }
 };
 
@@ -365,6 +382,7 @@ public unsafe struct Leaf
     const int   Dimension = 8;
 
     public static Material              ms_material;
+    public static Camera                ms_camera;
     static NativeList<JobHandle>        ms_handles      = new NativeList<JobHandle>(Allocator.Persistent);
     static NativeList<float3>           ms_positions    = new NativeList<float3>(Allocator.Persistent);
     static List<Mesh>                   ms_meshes       = new List<Mesh>();
@@ -424,13 +442,10 @@ public unsafe struct Leaf
     }
     public static void Draw()
     {
-        // Camera.current flickers :(
-        var cam = GameObject.Find("Main Camera");
-        var fov = cam.GetComponent<Camera>().fieldOfView;
-        fov = radians(fov);
-        var xform = cam.transform;
-        float3 fwd = xform.forward;
-        float3 eye = xform.position;
+        var cam = ms_camera;
+        var fov = radians(cam.fieldOfView);
+        float3 fwd = cam.transform.forward;
+        float3 eye = cam.transform.position;
         
         for(int i = 0; i < ms_meshes.Count; ++i)
         {
@@ -442,7 +457,7 @@ public unsafe struct Leaf
                 float d = dot(fwd, V);
                 if(acos(d) < fov)
                 {
-                    Graphics.DrawMesh(mesh, Matrix4x4.identity, ms_material, 0);
+                    Graphics.DrawMesh(mesh, Matrix4x4.identity, ms_material, 0, cam);
                 }
             }
         }
@@ -633,6 +648,7 @@ public class Mesher : MonoBehaviour
         m_center = GetComponent<Transform>().position;
         m_root = OctNode.Create(new OctNode(m_center, Radius));
         Leaf.ms_material = m_material;
+        Leaf.ms_camera = m_camera;
     }
     void Update()
     {
