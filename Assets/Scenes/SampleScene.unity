@@ -547,8 +547,6 @@ MonoBehaviour:
 
     Sub: Right Mouse
 
-    Clear: Z
-
     Toggle Shape: Key 1
 
     Size: Up / Down

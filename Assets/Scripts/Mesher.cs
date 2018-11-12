@@ -1,5 +1,6 @@
 ﻿using System.Collections.Generic;
 using Unity.Collections;
+using Unity.Collections.LowLevel.Unsafe;
 using Unity.Entities;
 using Unity.Jobs;
 using Unity.Burst;
@@ -53,12 +54,20 @@ public enum DistanceBlend
 // with position, size, shape, blending, and smoothness
 public struct CSG
 {
+    public static NativeList<CSG> ms_pool = new NativeList<CSG>(Allocator.Persistent);
+
     public float3           m_center;
     public float3           m_size;
     public DistanceFunction m_function;
     public DistanceBlend    m_blend;
     public float            m_smoothness;
 
+    public static int Create(CSG csg)
+    {
+        int id = ms_pool.Length;
+        ms_pool.Add(csg);
+        return id;
+    }
     public float3 Min()
     {
         return m_center - m_size;
@@ -148,6 +157,10 @@ public struct CSG
         float c = BlendSmoothAdd(-a, b, smoothness);
         return -c;
     }
+    public static void Shutdown()
+    {
+        ms_pool.Dispose();
+    }
 };
 
 [BurstCompile]
@@ -161,37 +174,51 @@ public struct CSGJob : IJobParallelFor
         public float3 d;
     };
     
-    public readonly float3     m_origin;
-    public readonly float      m_radius;
+    public float3       m_origin;
+    public float        m_radius;
     readonly int        m_dimension;
-    readonly float      m_pitch;
-    readonly float      m_pointSize;
+    float               m_pitch;
+    float               m_pointSize;
     NativeArray<uint>   m_ran;
     NativeArray<Vert>   m_positions;
     NativeArray<Vert>   m_normals;
 
     [ReadOnly]
     NativeArray<CSG>    m_list;
-
+    
     public CSGJob(
-        float3      center, 
-        float       radius, 
-        float       ptSize, 
-        int         dimension,
-        List<CSG>   items)
+        float                   ptSize, 
+        int                     dimension)
     {
-        int capacity = dimension * dimension * dimension;
-
+        m_pointSize = ptSize;
+        m_dimension = dimension;
+        m_list      = default(NativeArray<CSG>);
+        m_ran       = default(NativeArray<uint>);
+        m_positions = default(NativeArray<Vert>);
+        m_normals   = default(NativeArray<Vert>);
+        m_origin    = default(float3);
+        m_radius    = default(float);
+        m_pitch     = default(float);
+    }
+    public JobHandle Start(
+        float3          center, 
+        float           radius,
+        NativeList<int> list)
+    {
         m_origin = center - radius;
         m_radius = radius;
-        m_pointSize = ptSize;
+        m_pitch = (m_radius * 2.0f) / m_dimension;
 
-        m_dimension = dimension;
-        m_pitch = (m_radius * 2.0f) / dimension;
+        int capacity = m_dimension * m_dimension * m_dimension;
 
         m_list = new NativeArray<CSG>(
-            items.ToArray(), 
-            Allocator.TempJob);
+            list.Length, 
+            Allocator.TempJob,
+            NativeArrayOptions.UninitializedMemory);
+        for(int i = 0; i < list.Length; ++i)
+        {
+            m_list[i] = CSG.ms_pool[list[i]];
+        }
         m_ran = new NativeArray<uint>(
             capacity,
             Allocator.TempJob,
@@ -204,10 +231,8 @@ public struct CSGJob : IJobParallelFor
             capacity,
             Allocator.TempJob,
             NativeArrayOptions.UninitializedMemory);
-    }
-    public JobHandle Start()
-    {
-        return this.Schedule(m_dimension * m_dimension * m_dimension, m_dimension);
+
+        return this.Schedule(capacity, m_dimension);
     }
     public float Distance(float3 pt)
     {
@@ -279,7 +304,7 @@ public struct CSGJob : IJobParallelFor
             d = Normal(m_positions[idx].d),
         };
     }
-    public Mesh CreateMesh(JobHandle handle)
+    public void Finish(JobHandle handle, Mesh mesh)
     {
         handle.Complete();
 
@@ -325,224 +350,268 @@ public struct CSGJob : IJobParallelFor
         m_ran.Dispose();
         m_positions.Dispose();
         m_normals.Dispose();
+        
+        mesh.vertices   = verts;
+        mesh.normals    = norms;
+        mesh.triangles  = inds;
 
-        var mesh = new Mesh();
-
-        mesh.vertices = verts;
-        mesh.normals = norms;
-        mesh.triangles = inds;
-
-        return mesh;
+        mesh.RecalculateBounds();
     }
 };
 
-public class Cell
+public unsafe struct Leaf
 {
-    const float PointSize = 0.1f;
-    const int   Dimension = 20;
+    const float PointSize = 0.15f;
+    const int   Dimension = 8;
 
-    public static Material      ms_material;
-    public static List<Cell>    ms_cells = new List<Cell>();
+    public static Material              ms_material;
+    static NativeList<JobHandle>        ms_handles      = new NativeList<JobHandle>(Allocator.Persistent);
+    static NativeList<float3>           ms_positions    = new NativeList<float3>(Allocator.Persistent);
+    static List<Mesh>                   ms_meshes       = new List<Mesh>();
+    static List<CSGJob>                 ms_jobs         = new List<CSGJob>();
+    static List<NativeList<int>>        ms_items        = new List<NativeList<int>>();
+    
+    int             m_slot;
+    int             m_running;
 
-    List<CSG>   m_csgs;
-    Mesh        m_mesh;
-    CSGJob      m_job;
-    JobHandle   m_handle;
-    bool        m_running;
-    bool        m_hasInserted;
-
-    public Cell()
+    public void Init()
     {
-        m_csgs = new List<CSG>();
-        m_running = false;
-        m_hasInserted = false;
-    }
-    public void Start(float3 center, float radius)
-    {
-        m_job = new CSGJob(
-            center,
-            radius,
+        var job = new CSGJob(
             PointSize,
-            Dimension,
-            m_csgs);
+            Dimension);
 
-        m_handle = m_job.Start();
-        m_running = true;
+        m_slot = ms_handles.Length;
+        ms_handles.Add(new JobHandle());
+        ms_positions.Add(new float3());
+        ms_meshes.Add(new Mesh());
+        ms_jobs.Add(job);
+        ms_items.Add(new NativeList<int>(Allocator.Persistent));
+
+        m_running = 0;
     }
-    public void Add(CSG csg)
+    public bool Start(float3 center, float radius)
     {
-        m_csgs.Add(csg);
-    }
-    public bool IsCompleted()
-    {
-        return m_handle.IsCompleted;
-    }
-    public bool IsRunning()
-    {
-        return m_running;
-    }
-    public void Finish()
-    {
-        if(m_running)
+        if(m_running != 0)
         {
-            m_mesh = m_job.CreateMesh(m_handle);
-            m_running = false;
-
-            if (!m_hasInserted)
-            {
-                ms_cells.Add(this);
-                m_hasInserted = true;
-            }
+            return false;
         }
+        ms_positions[m_slot] = center;
+        var job = ms_jobs[m_slot];
+        ms_handles[m_slot] = job.Start(center, radius, ms_items[m_slot]);
+        ms_jobs[m_slot] = job;
+        m_running = 1;
+        return true;
     }
-    public float3 GetPosition()
+    public void Add(int csg)
     {
-        return m_job.m_origin + m_job.m_radius;
+        ms_items[m_slot].Add(csg);
+    }
+    public bool Finish()
+    {
+        if(m_running != 0)
+        {
+            if(ms_handles[m_slot].IsCompleted)
+            {
+                var job = ms_jobs[m_slot];
+                job.Finish(ms_handles[m_slot], ms_meshes[m_slot]);
+                ms_jobs[m_slot] = job;
+                m_running = 0;
+                return true;
+            }
+            return false;
+        }
+        return true;
     }
     public static void Draw()
     {
         // Camera.current flickers :(
         var cam = GameObject.Find("Main Camera");
+        var fov = cam.GetComponent<Camera>().fieldOfView;
+        fov = radians(fov);
         var xform = cam.transform;
-        var fwd = xform.forward;
-        var eye = xform.position;
-        foreach(var cell in ms_cells)
+        float3 fwd = xform.forward;
+        float3 eye = xform.position;
+        
+        for(int i = 0; i < ms_meshes.Count; ++i)
         {
-            if(cell.m_mesh.vertices.Length == 0)
+            var mesh = ms_meshes[i];
+            if(mesh.vertices.Length > 0)
             {
-                continue;
-            }
-
-            var V = normalize(cell.GetPosition() - (float3)eye);
-            float d = dot(fwd, V);
-            if(d > 0.0f)
-            {
-                Graphics.DrawMesh(cell.m_mesh, Matrix4x4.identity, ms_material, 0);
+                var pos = ms_positions[i];
+                var V = normalize(pos - eye);
+                float d = dot(fwd, V);
+                if(acos(d) < fov)
+                {
+                    Graphics.DrawMesh(mesh, Matrix4x4.identity, ms_material, 0);
+                }
             }
         }
     }
-    public static void ClearAll()
+    public static void Shutdown()
     {
-        foreach(var cell in ms_cells)
+        for(int i = 0; i < ms_items.Count; ++i)
         {
-            cell.Finish();
+            ms_items[i].Dispose();
         }
-        ms_cells.Clear();
+        ms_handles.Dispose();
+        ms_positions.Dispose();
+        ms_meshes.Clear();
+        ms_jobs.Clear();
+        ms_items.Clear();
+        CSG.Shutdown();
     }
 };
 
-public class OctNode
+public unsafe struct OctNode
 {
     const int MaxDepth = 6;
 
-    static Queue<OctNode>   ms_dirtyQueue = new Queue<OctNode>();
-    static Queue<Cell>      ms_workingQueue = new Queue<Cell>();
+    public static NativeList<OctNode>   ms_pool             = new NativeList<OctNode>(Allocator.Persistent);
+    static NativeQueue<int>             ms_dirtyNodes       = new NativeQueue<int>(Allocator.Persistent);
+    static NativeQueue<int>             ms_workingCells     = new NativeQueue<int>(Allocator.Persistent);
 
-    OctNode[]       m_children;
-    Cell            m_cell;
+    fixed int       m_children[8];
+    Leaf            m_leaf;
     readonly float3 m_center;
     readonly float  m_radius;
     readonly int    m_depth;
 
-    public OctNode(float3 center, float radius, int depth = 0)
+    public static int Create(OctNode node)
     {
-        m_children = null;
-        m_cell = null;
+        int id = ms_pool.Length;
+        ms_pool.Add(node);
+        return id;
+    }
+    public OctNode(
+        float3  center, 
+        float   radius, 
+        int     depth = 0)
+    {
+        fixed (int* c = m_children)
+        {
+            c[0] = -1;
+        }
         m_center = center;
         m_radius = radius;
         m_depth = depth;
 
-        if(m_depth == MaxDepth)
+        m_leaf = default(Leaf);
+        if (m_depth == MaxDepth)
         {
-            m_cell = new Cell();
+            m_leaf = new Leaf();
+            m_leaf.Init();
         }
     }
     void EnsureChildren()
     {
-        if (m_children == null)
+        fixed(int* c = m_children)
         {
-            m_children = new OctNode[8];
-            float radius = m_radius * 0.5f;
-            for (int i = 0; i < 8; ++i)
+            if (c[0] == -1)
             {
-                float3 center = m_center;
-                center.x += (i & 1) == 0 ? -radius : radius;
-                center.y += (i & 2) == 0 ? -radius : radius;
-                center.z += (i & 4) == 0 ? -radius : radius;
-                m_children[i] = new OctNode(center, radius, m_depth + 1);
+                float radius = m_radius * 0.5f;
+                for (int i = 0; i < 8; ++i)
+                {
+                    float3 center = m_center;
+                    center.x += (i & 1) == 0 ? -radius : radius;
+                    center.y += (i & 2) == 0 ? -radius : radius;
+                    center.z += (i & 4) == 0 ? -radius : radius;
+                    c[i] = OctNode.Create(new OctNode(center, radius, m_depth + 1));
+                }
             }
         }
     }
-    bool Contains(ref CSG csg)
+    bool Contains(CSG csg)
     {
         return csg.Distance(m_center) < m_radius * Util.CornerConstant;
     }
-    public void Insert(CSG csg)
+    public void Insert(int nodeID, int csgID)
     {
-        if(!Contains(ref csg))
+        if(!Contains(CSG.ms_pool[csgID]))
         {
             return;
         }
-
+        
         if(m_depth == MaxDepth)
         {
-            m_cell.Add(csg);
-            ms_dirtyQueue.Enqueue(this);
+            m_leaf.Add(csgID);
+            ms_dirtyNodes.Enqueue(nodeID);
             return;
         }
 
         EnsureChildren();
 
-        for(int i = 0; i < 8; ++i)
+        fixed(int* c = m_children)
         {
-            m_children[i].Insert(csg);
+            for (int i = 0; i < 8; ++i)
+            {
+                int id = c[i];
+                var node = ms_pool[id];
+                node.Insert(id, csgID);
+                ms_pool[id] = node;
+            }
         }
     }
     public static void UpdateJobs()
     {
-        int dirtyCount = ms_dirtyQueue.Count;
-        int workCount = ms_workingQueue.Count;
+        int dirtyCount = ms_dirtyNodes.Count;
+        int workCount = ms_workingCells.Count;
 
         for (int i = 0; i < dirtyCount; ++i)
         {
-            var node = ms_dirtyQueue.Dequeue();
-            var cell = node.m_cell;
-            if(cell.IsCompleted() & !cell.IsRunning())
+            var nodeID = ms_dirtyNodes.Dequeue();
+            var node = ms_pool[nodeID];
+
+            bool started = node.m_leaf.Start(node.m_center, node.m_radius);
+
+            ms_pool[nodeID] = node;
+
+            if(started)
             {
-                cell.Start(node.m_center, node.m_radius);
-                ms_workingQueue.Enqueue(cell);
-                continue;
+                ms_workingCells.Enqueue(nodeID);
             }
-            ms_dirtyQueue.Enqueue(node);
+            else
+            {
+                ms_dirtyNodes.Enqueue(nodeID);
+            }
         }
 
         JobHandle.ScheduleBatchedJobs();
 
         for (int i = 0; i < workCount; ++i)
         {
-            var cell = ms_workingQueue.Dequeue();
-            if(cell.IsCompleted())
+            var nodeID = ms_workingCells.Dequeue();
+            var node = ms_pool[nodeID];
+            bool finished = node.m_leaf.Finish();
+            ms_pool[nodeID] = node;
+            if(!finished)
             {
-                cell.Finish();
-            }
-            else
-            {
-                ms_workingQueue.Enqueue(cell);
+                ms_workingCells.Enqueue(nodeID);
             }
         }
     }
     public static void FinishAll()
     {
-        while(ms_dirtyQueue.Count > 0 || ms_workingQueue.Count > 0)
+        while(ms_dirtyNodes.Count > 0 || ms_workingCells.Count > 0)
         {
             UpdateJobs();
         }
+    }
+    public static void Shutdown()
+    {
+        for(int i = 0; i < ms_pool.Length; ++i)
+        {
+            ms_pool[i].m_leaf.Finish();
+        }
+        ms_pool.Dispose();
+        ms_dirtyNodes.Dispose();
+        ms_workingCells.Dispose();
+        Leaf.Shutdown();
     }
 };
 
 public class Mesher : MonoBehaviour
 {
-    const float Radius      = 100.0f;
+    const float Radius      = 50.0f;
     const float GrowRate    = 1.05f;
     const float ShrinkRate  = 0.95f;
 
@@ -552,7 +621,7 @@ public class Mesher : MonoBehaviour
     public Mesh         m_sphereShape;
     public Mesh         m_boxShape;
 
-    OctNode             m_root;
+    int                 m_root;
     float3              m_center;
     float3              m_size          = 1.0f;
     float               m_armLength     = 10.0f;
@@ -562,19 +631,19 @@ public class Mesher : MonoBehaviour
     void Start()
     {
         m_center = GetComponent<Transform>().position;
-        m_root = new OctNode(m_center, Radius);
-        Cell.ms_material = m_material;
+        m_root = OctNode.Create(new OctNode(m_center, Radius));
+        Leaf.ms_material = m_material;
     }
     void Update()
     {
         ControlsUpdate();
         SetBrush();
         OctNode.UpdateJobs();
-        Cell.Draw();
+        Leaf.Draw();
     }
     void OnDisable()
     {
-        OctNode.FinishAll();
+        OctNode.Shutdown();
     }
     void ControlsUpdate()
     {
@@ -588,7 +657,7 @@ public class Mesher : MonoBehaviour
         }
         if(Input.GetKey(KeyCode.Z))
         {
-            ClearAll();
+            //ClearAll();
         }
         if (Input.GetKeyDown(KeyCode.Alpha1))
         {
@@ -673,12 +742,8 @@ public class Mesher : MonoBehaviour
             m_size = m_size,
             m_smoothness = m_smoothness,
         };
-        m_root.Insert(csg);
-    }
-    void ClearAll()
-    {
-        OctNode.FinishAll();
-        Cell.ClearAll();
-        m_root = new OctNode(m_center, Radius);
+        var root = OctNode.ms_pool[m_root];
+        root.Insert(m_root, CSG.Create(csg));
+        OctNode.ms_pool[m_root] = root;
     }
 };
