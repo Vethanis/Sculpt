@@ -5,5 +5,5 @@ A port of my meshing project from C++ to the Unity job system. This program gene
 
 ## **Video**
 
-[![](http://img.youtube.com/vi/jJ_G_OzBI7w/0.jpg)](http://www.youtube.com/watch?v=jJ_G_OzBI7w)
+[![](https://i.imgur.com/MevYAJT.png)](https://vimeo.com/300385552)
 
